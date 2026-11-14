@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "elytrahunter",
+  "version": "${version}",
+  "name": "Elytra Hunter",
+  "description": "Elytra + offhand firework: locks onto the nearest player, rockets into them, sword-hits, backs off, repeats until the kill.",
+  "authors": ["you"],
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.elytrahunter.ElytraHunterClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
