@@ -1,5 +1,6 @@
-package com.elytrahunter;
 
+package com.elytrahunter;
+ 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.MinecraftClient;
@@ -13,9 +14,9 @@ import net.minecraft.util.Hand;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
-
+ 
 import java.util.Set;
-
+ 
 /**
  * Elytra Hunter
  *
@@ -23,49 +24,51 @@ import java.util.Set;
  * Saf client-tick mantigi: render/GL/Mixin yok -> VulkanMod (ve Sodium vb.) ile cakismaz.
  */
 public class ElytraHunterClient implements ClientModInitializer {
-
+ 
     // ---------- AYARLAR ----------
     private static final double SCAN_RANGE        = 96.0;  // hedef tarama menzili (blok)
     private static final double ATTACK_REACH      = 3.0;   // vurus mesafesi (hitbox'a en yakin nokta)
     private static final double NO_BOOST_DIST     = 5.0;   // bu mesafeden yakinda fisek atma (ustunden gecmesin)
     private static final double RETREAT_DISTANCE  = 6.0;   // vurduktan sonra bu kadar uzaklas
     private static final int    RETREAT_MAX_TICKS = 12;    // uzaklasma zaman asimi
-    private static final int    FIREWORK_INTERVAL = 2;     // kac tickte bir fisek (1 = her tick)
+    private static final double MIN_BOOST_SPEED   = 1.1;   // hiz (blok/tick) bunun ALTINA dusmeden yeni fisek atma (1.1 ~ 22 blok/sn)
+    private static final int    FIREWORK_MIN_GAP  = 8;     // iki fisek arasi en az bu kadar tick
     private static final float  MIN_COOLDOWN      = 0.9f;  // kilic vurus hazirligi (0..1)
     private static final Set<String> FRIENDS      = Set.of(); // dokunulmayacak oyuncu adlari, ornek: Set.of("arkadas1")
     // ------------------------------
-
+ 
     private enum State { APPROACH, RETREAT }
-
+ 
     private State state = State.APPROACH;
     private AbstractClientPlayerEntity target;
     private Vec3d lastTargetPos;
     private int retreatTicks;
     private int tickCounter;
+    private int lastFireworkTick = -1000;
     private boolean jumpHeld;
-
+ 
     @Override
     public void onInitializeClient() {
         // START tick: donus ve paketler bu tick'in hareket paketine dahil olsun (1 tick gecikme yok)
         ClientTickEvents.START_CLIENT_TICK.register(this::tick);
     }
-
+ 
     private void tick(MinecraftClient mc) {
         ClientPlayerEntity p = mc.player;
         if (p == null || mc.world == null || mc.interactionManager == null || mc.currentScreen != null) {
             reset(mc);
             return;
         }
-
+ 
         // Tetik: elytra giyili + sol elde fisek
         if (!p.getEquippedStack(EquipmentSlot.CHEST).isOf(Items.ELYTRA)
                 || !p.getOffHandStack().isOf(Items.FIREWORK_ROCKET)) {
             reset(mc);
             return;
         }
-
+ 
         tickCounter++;
-
+ 
         if (target == null || !valid(p, target)) {
             target = findTarget(mc, p);
             state = State.APPROACH;
@@ -76,20 +79,20 @@ public class ElytraHunterClient implements ClientModInitializer {
             releaseJump(mc);
             return;
         }
-
+ 
         // Hedef hizi (tick basina), yon tahmini icin
         Vec3d tPos = new Vec3d(target.getX(), target.getY() + target.getHeight() * 0.5, target.getZ());
         Vec3d tVel = lastTargetPos == null ? Vec3d.ZERO : tPos.subtract(lastTargetPos);
         lastTargetPos = tPos;
-
+ 
         Vec3d eye = new Vec3d(p.getX(), p.getEyeY(), p.getZ());
         double dist = eye.distanceTo(tPos);
-
+ 
         // Tahmini nokta (hedefin gidecegi yere kilit)
         double mySpeed = Math.max(p.getVelocity().length(), 1.0);
         double leadTicks = MathHelper.clamp(dist / mySpeed, 0.0, 4.0);
         Vec3d predicted = tPos.add(tVel.multiply(leadTicks));
-
+ 
         // Havada degilsek: kalkis (ziplama tusunu ardisik tickte birak/bas -> havada elytra acilir)
         if (!p.isGliding()) {
             jumpHeld = true;
@@ -98,17 +101,17 @@ public class ElytraHunterClient implements ClientModInitializer {
             return;
         }
         releaseJump(mc);
-
+ 
         // Kilic sec (hotbar)
         equipSword(p);
-
+ 
         if (state == State.APPROACH) {
             lookAt(p, eye, predicted);
-
+ 
             if (dist > NO_BOOST_DIST) {
                 useFirework(mc, p);
             }
-
+ 
             if (reachDistance(eye, target) <= ATTACK_REACH
                     && p.getAttackCooldownProgress(0.0f) >= MIN_COOLDOWN) {
                 mc.interactionManager.attackEntity(p, target);
@@ -123,7 +126,7 @@ public class ElytraHunterClient implements ClientModInitializer {
             Vec3d awayPoint = eye.add(away.normalize().multiply(8.0)).add(0, 1.0, 0);
             lookAt(p, eye, awayPoint);
             useFirework(mc, p);
-
+ 
             boolean far = dist >= RETREAT_DISTANCE;
             boolean ready = p.getAttackCooldownProgress(0.0f) >= MIN_COOLDOWN;
             if ((far && ready) || retreatTicks >= RETREAT_MAX_TICKS) {
@@ -131,14 +134,14 @@ public class ElytraHunterClient implements ClientModInitializer {
             }
         }
     }
-
+ 
     // ---------- yardimcilar ----------
-
+ 
     private boolean valid(ClientPlayerEntity p, AbstractClientPlayerEntity t) {
         return t.isAlive() && !t.isRemoved() && !t.isSpectator()
                 && p.distanceTo(t) <= SCAN_RANGE * 1.5;
     }
-
+ 
     private AbstractClientPlayerEntity findTarget(MinecraftClient mc, ClientPlayerEntity p) {
         AbstractClientPlayerEntity best = null;
         double bestDist = SCAN_RANGE;
@@ -153,7 +156,7 @@ public class ElytraHunterClient implements ClientModInitializer {
         }
         return best;
     }
-
+ 
     /** Gozden hedefin hitbox'ina en yakin noktaya mesafe. */
     private double reachDistance(Vec3d eye, AbstractClientPlayerEntity t) {
         Box b = t.getBoundingBox();
@@ -162,7 +165,7 @@ public class ElytraHunterClient implements ClientModInitializer {
         double z = MathHelper.clamp(eye.z, b.minZ, b.maxZ);
         return eye.distanceTo(new Vec3d(x, y, z));
     }
-
+ 
     /** Aninda, yumusatmasiz kilit. */
     private void lookAt(ClientPlayerEntity p, Vec3d eye, Vec3d point) {
         double dx = point.x - eye.x;
@@ -174,13 +177,16 @@ public class ElytraHunterClient implements ClientModInitializer {
         p.setYaw(yaw);
         p.setPitch(MathHelper.clamp(pitch, -90.0f, 90.0f));
     }
-
+ 
     private void useFirework(MinecraftClient mc, ClientPlayerEntity p) {
-        if (tickCounter % FIREWORK_INTERVAL != 0) return;
+        if (tickCounter - lastFireworkTick < FIREWORK_MIN_GAP) return;
+        // Momentum hala yuksekse (onceki fisek calisiyor / hiz dusmedi) yeni fisek harcama
+        if (p.getVelocity().length() > MIN_BOOST_SPEED) return;
         if (!p.getOffHandStack().isOf(Items.FIREWORK_ROCKET)) return;
         mc.interactionManager.interactItem(p, Hand.OFF_HAND);
+        lastFireworkTick = tickCounter;
     }
-
+ 
     private void equipSword(ClientPlayerEntity p) {
         if (p.getMainHandStack().isIn(ItemTags.SWORDS)) return;
         PlayerInventory inv = p.getInventory();
@@ -191,19 +197,21 @@ public class ElytraHunterClient implements ClientModInitializer {
             }
         }
     }
-
+ 
     private void releaseJump(MinecraftClient mc) {
         if (jumpHeld) {
             mc.options.jumpKey.setPressed(false);
             jumpHeld = false;
         }
     }
-
+ 
     private void reset(MinecraftClient mc) {
         releaseJump(mc);
         target = null;
         lastTargetPos = null;
         state = State.APPROACH;
         retreatTicks = 0;
+        lastFireworkTick = -1000;
     }
 }
+ 
