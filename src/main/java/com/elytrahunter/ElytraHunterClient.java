@@ -1,8 +1,8 @@
-
 package com.elytrahunter;
- 
+
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.AbstractClientPlayerEntity;
 import net.minecraft.client.network.ClientPlayerEntity;
@@ -10,67 +10,118 @@ import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Items;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
- 
+import org.lwjgl.glfw.GLFW;
+
 import java.util.Set;
- 
+
 /**
- * Elytra Hunter
+ * Elytra Hunter 1.1.0
  *
- * Aktif olma sartlari: govdede ELYTRA + SOL ELDE (offhand) FISEK.
- * Saf client-tick mantigi: render/GL/Mixin yok -> VulkanMod (ve Sodium vb.) ile cakismaz.
+ * Hunting logic = 1.0.0 logic (ported from the compiled classes, same constants).
+ * New in 1.1.0: config (firework interval), settings screen, always-on HUD tab, target marker.
  */
 public class ElytraHunterClient implements ClientModInitializer {
- 
-    // ---------- AYARLAR ----------
-    private static final double SCAN_RANGE        = 96.0;  // hedef tarama menzili (blok)
-    private static final double ATTACK_REACH      = 3.0;   // vurus mesafesi (hitbox'a en yakin nokta)
-    private static final double NO_BOOST_DIST     = 5.0;   // bu mesafeden yakinda fisek atma (ustunden gecmesin)
-    private static final double RETREAT_DISTANCE  = 6.0;   // vurduktan sonra bu kadar uzaklas
-    private static final int    RETREAT_MAX_TICKS = 12;    // uzaklasma zaman asimi
-    private static final double MIN_BOOST_SPEED   = 1.1;   // hiz (blok/tick) bunun ALTINA dusmeden yeni fisek atma (1.1 ~ 22 blok/sn)
-    private static final int    FIREWORK_MIN_GAP  = 8;     // iki fisek arasi en az bu kadar tick
-    private static final float  MIN_COOLDOWN      = 0.9f;  // kilic vurus hazirligi (0..1)
-    private static final Set<String> FRIENDS      = Set.of(); // dokunulmayacak oyuncu adlari, ornek: Set.of("arkadas1")
-    // ------------------------------
- 
-    private enum State { APPROACH, RETREAT }
- 
+
+    public enum State { APPROACH, RETREAT }
+
+    // ---- constants of the original 1.0.0 ----
+    private static final double SCAN_RANGE = 96.0;        // new target search radius
+    private static final double KEEP_RANGE = 144.0;       // target is dropped beyond this
+    private static final double ATTACK_REACH = 3.0;
+    private static final double NO_BOOST_DIST = 5.0;      // no rockets while closer than this (approach)
+    private static final double RETREAT_DISTANCE = 6.0;
+    private static final int RETREAT_MAX_TICKS = 12;
+    private static final float MIN_COOLDOWN = 0.9f;
+    private static final Set<String> FRIENDS = Set.of();  // names that are never targeted
+
+    // ---- hotkeys (polled with GLFW, only while no screen is open) ----
+    private static final int KEY_MENU = GLFW.GLFW_KEY_RIGHT_SHIFT;
+    private static final int KEY_TOGGLE = GLFW.GLFW_KEY_H;
+
+    private static ElytraHunterClient instance;
+
     private State state = State.APPROACH;
     private AbstractClientPlayerEntity target;
     private Vec3d lastTargetPos;
     private int retreatTicks;
     private int tickCounter;
-    private int lastFireworkTick = -1000;
+    private int rocketCooldown = 1000;
     private boolean jumpHeld;
- 
+    private boolean active;
+    private boolean menuKeyWas;
+    private boolean toggleKeyWas;
+
+    // ---- snapshots used by the HUD for smooth interpolation (written at END tick) ----
+    Vec3d prevEye, curEye, prevTarget, curTarget;
+    float prevYaw, curYaw, prevPitch, curPitch;
+    long tickEndNanos = System.nanoTime();
+    private AbstractClientPlayerEntity snapTarget;
+    private boolean hasSnap;
+
+    public static ElytraHunterClient instance() { return instance; }
+    public State getState() { return state; }
+    public AbstractClientPlayerEntity getTarget() { return target; }
+    public boolean isActive() { return active; }
+
     @Override
     public void onInitializeClient() {
-        // START tick: donus ve paketler bu tick'in hareket paketine dahil olsun (1 tick gecikme yok)
+        instance = this;
+        HunterConfig.load();
         ClientTickEvents.START_CLIENT_TICK.register(this::tick);
+        ClientTickEvents.END_CLIENT_TICK.register(this::endTick);
+        HudElementRegistry.addLast(Identifier.of("elytrahunter", "hud"),
+                (context, tickCounter) -> HunterHud.render(context, MinecraftClient.getInstance()));
     }
- 
+
+    // ------------------------------------------------------------------ keys
+    private void pollKeys(MinecraftClient mc) {
+        if (mc.getWindow() == null) return;
+        long window = mc.getWindow().getHandle();
+        boolean menuDown = GLFW.glfwGetKey(window, KEY_MENU) == GLFW.GLFW_PRESS;
+        boolean toggleDown = GLFW.glfwGetKey(window, KEY_TOGGLE) == GLFW.GLFW_PRESS;
+
+        if (mc.currentScreen == null && mc.player != null) {
+            if (menuDown && !menuKeyWas) {
+                mc.setScreen(new HunterScreen());
+            }
+            if (toggleDown && !toggleKeyWas) {
+                HunterConfig.enabled = !HunterConfig.enabled;
+                HunterConfig.save();
+                mc.player.sendMessage(Text.literal("Elytra Hunter: "
+                        + (HunterConfig.enabled ? "A\u00c7IK" : "KAPALI")), true);
+            }
+        }
+        menuKeyWas = menuDown;
+        toggleKeyWas = toggleDown;
+    }
+
+    // ------------------------------------------------------------------ main tick (original logic)
     private void tick(MinecraftClient mc) {
-        ClientPlayerEntity p = mc.player;
-        if (p == null || mc.world == null || mc.interactionManager == null || mc.currentScreen != null) {
+        pollKeys(mc);
+
+        ClientPlayerEntity player = mc.player;
+        if (player == null || mc.world == null || mc.interactionManager == null || mc.currentScreen != null) {
             reset(mc);
             return;
         }
- 
-        // Tetik: elytra giyili + sol elde fisek
-        if (!p.getEquippedStack(EquipmentSlot.CHEST).isOf(Items.ELYTRA)
-                || !p.getOffHandStack().isOf(Items.FIREWORK_ROCKET)) {
+        if (!HunterConfig.enabled
+                || !player.getEquippedStack(EquipmentSlot.CHEST).isOf(Items.ELYTRA)
+                || !player.getOffHandStack().isOf(Items.FIREWORK_ROCKET)) {
             reset(mc);
             return;
         }
- 
+        active = true;
         tickCounter++;
- 
-        if (target == null || !valid(p, target)) {
-            target = findTarget(mc, p);
+        if (rocketCooldown < 1000) rocketCooldown++;
+
+        if (target == null || !valid(player, target)) {
+            target = findTarget(mc, player);
             state = State.APPROACH;
             lastTargetPos = null;
             retreatTicks = 0;
@@ -79,76 +130,71 @@ public class ElytraHunterClient implements ClientModInitializer {
             releaseJump(mc);
             return;
         }
- 
-        // Hedef hizi (tick basina), yon tahmini icin
-        Vec3d tPos = new Vec3d(target.getX(), target.getY() + target.getHeight() * 0.5, target.getZ());
-        Vec3d tVel = lastTargetPos == null ? Vec3d.ZERO : tPos.subtract(lastTargetPos);
-        lastTargetPos = tPos;
- 
-        Vec3d eye = new Vec3d(p.getX(), p.getEyeY(), p.getZ());
-        double dist = eye.distanceTo(tPos);
- 
-        // Tahmini nokta (hedefin gidecegi yere kilit)
-        double mySpeed = Math.max(p.getVelocity().length(), 1.0);
-        double leadTicks = MathHelper.clamp(dist / mySpeed, 0.0, 4.0);
-        Vec3d predicted = tPos.add(tVel.multiply(leadTicks));
- 
-        // Havada degilsek: kalkis (ziplama tusunu ardisik tickte birak/bas -> havada elytra acilir)
-        if (!p.isGliding()) {
+
+        Vec3d targetPos = new Vec3d(target.getX(), target.getY() + target.getHeight() * 0.5, target.getZ());
+        Vec3d targetVel = lastTargetPos == null ? Vec3d.ZERO : targetPos.subtract(lastTargetPos);
+        lastTargetPos = targetPos;
+
+        Vec3d eye = new Vec3d(player.getX(), player.getEyeY(), player.getZ());
+        double dist = eye.distanceTo(targetPos);
+        double speed = Math.max(player.getVelocity().length(), 1.0);
+        double lead = MathHelper.clamp(dist / speed, 0.0, 4.0);
+        Vec3d aim = targetPos.add(targetVel.multiply(lead));
+
+        if (!player.isGliding()) {
+            // on the ground / falling: tap jump every other tick to open the elytra
             jumpHeld = true;
             mc.options.jumpKey.setPressed(tickCounter % 2 == 0);
-            lookAt(p, eye, predicted);
+            lookAt(player, eye, aim);
             return;
         }
+
         releaseJump(mc);
- 
-        // Kilic sec (hotbar)
-        equipSword(p);
- 
+        equipSword(player);
+
         if (state == State.APPROACH) {
-            lookAt(p, eye, predicted);
- 
+            lookAt(player, eye, aim);
             if (dist > NO_BOOST_DIST) {
-                useFirework(mc, p);
+                useFirework(mc, player);
             }
- 
             if (reachDistance(eye, target) <= ATTACK_REACH
-                    && p.getAttackCooldownProgress(0.0f) >= MIN_COOLDOWN) {
-                mc.interactionManager.attackEntity(p, target);
-                p.swingHand(Hand.MAIN_HAND);
+                    && player.getAttackCooldownProgress(0.0f) >= MIN_COOLDOWN) {
+                mc.interactionManager.attackEntity(player, target);
+                player.swingHand(Hand.MAIN_HAND);
                 state = State.RETREAT;
                 retreatTicks = 0;
             }
-        } else { // RETREAT: azicik uzaklas, sonra tekrar dal
+        } else {
             retreatTicks++;
-            Vec3d away = eye.subtract(tPos);
-            if (away.lengthSquared() < 1.0E-4) away = new Vec3d(0, 1, 0);
-            Vec3d awayPoint = eye.add(away.normalize().multiply(8.0)).add(0, 1.0, 0);
-            lookAt(p, eye, awayPoint);
-            useFirework(mc, p);
- 
-            boolean far = dist >= RETREAT_DISTANCE;
-            boolean ready = p.getAttackCooldownProgress(0.0f) >= MIN_COOLDOWN;
-            if ((far && ready) || retreatTicks >= RETREAT_MAX_TICKS) {
+            Vec3d away = eye.subtract(targetPos);
+            if (away.lengthSquared() < 1.0E-4) {
+                away = new Vec3d(0.0, 1.0, 0.0);
+            }
+            Vec3d retreatPoint = eye.add(away.normalize().multiply(8.0)).add(0.0, 1.0, 0.0);
+            lookAt(player, eye, retreatPoint);
+            useFirework(mc, player);
+
+            boolean farEnough = dist >= RETREAT_DISTANCE;
+            boolean ready = player.getAttackCooldownProgress(0.0f) >= MIN_COOLDOWN;
+            if ((farEnough && ready) || retreatTicks >= RETREAT_MAX_TICKS) {
                 state = State.APPROACH;
             }
         }
     }
- 
-    // ---------- yardimcilar ----------
- 
-    private boolean valid(ClientPlayerEntity p, AbstractClientPlayerEntity t) {
-        return t.isAlive() && !t.isRemoved() && !t.isSpectator()
-                && p.distanceTo(t) <= SCAN_RANGE * 1.5;
+
+    private boolean valid(ClientPlayerEntity player, AbstractClientPlayerEntity t) {
+        return t.isAlive() && !t.isRemoved() && !t.isSpectator() && player.distanceTo(t) <= KEEP_RANGE;
     }
- 
-    private AbstractClientPlayerEntity findTarget(MinecraftClient mc, ClientPlayerEntity p) {
+
+    private AbstractClientPlayerEntity findTarget(MinecraftClient mc, ClientPlayerEntity player) {
         AbstractClientPlayerEntity best = null;
         double bestDist = SCAN_RANGE;
         for (AbstractClientPlayerEntity other : mc.world.getPlayers()) {
-            if (other == p || !other.isAlive() || other.isSpectator()) continue;
+            if (other == player) continue;
+            if (!other.isAlive()) continue;
+            if (other.isSpectator()) continue;
             if (FRIENDS.contains(other.getGameProfile().name())) continue;
-            double d = p.distanceTo(other);
+            double d = player.distanceTo(other);
             if (d < bestDist) {
                 bestDist = d;
                 best = other;
@@ -156,40 +202,38 @@ public class ElytraHunterClient implements ClientModInitializer {
         }
         return best;
     }
- 
-    /** Gozden hedefin hitbox'ina en yakin noktaya mesafe. */
-    private double reachDistance(Vec3d eye, AbstractClientPlayerEntity t) {
-        Box b = t.getBoundingBox();
-        double x = MathHelper.clamp(eye.x, b.minX, b.maxX);
-        double y = MathHelper.clamp(eye.y, b.minY, b.maxY);
-        double z = MathHelper.clamp(eye.z, b.minZ, b.maxZ);
-        return eye.distanceTo(new Vec3d(x, y, z));
+
+    /** Distance from a point to the closest point of the target's hitbox. */
+    private double reachDistance(Vec3d from, AbstractClientPlayerEntity t) {
+        Box box = t.getBoundingBox();
+        double x = MathHelper.clamp(from.x, box.minX, box.maxX);
+        double y = MathHelper.clamp(from.y, box.minY, box.maxY);
+        double z = MathHelper.clamp(from.z, box.minZ, box.maxZ);
+        return from.distanceTo(new Vec3d(x, y, z));
     }
- 
-    /** Aninda, yumusatmasiz kilit. */
-    private void lookAt(ClientPlayerEntity p, Vec3d eye, Vec3d point) {
-        double dx = point.x - eye.x;
-        double dy = point.y - eye.y;
-        double dz = point.z - eye.z;
-        double horiz = Math.sqrt(dx * dx + dz * dz);
+
+    private void lookAt(ClientPlayerEntity player, Vec3d from, Vec3d to) {
+        double dx = to.x - from.x;
+        double dy = to.y - from.y;
+        double dz = to.z - from.z;
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
         float yaw = (float) (MathHelper.atan2(dz, dx) * 180.0 / Math.PI) - 90.0f;
-        float pitch = (float) -(MathHelper.atan2(dy, horiz) * 180.0 / Math.PI);
-        p.setYaw(yaw);
-        p.setPitch(MathHelper.clamp(pitch, -90.0f, 90.0f));
+        float pitch = (float) (-(MathHelper.atan2(dy, horizontal) * 180.0 / Math.PI));
+        player.setYaw(yaw);
+        player.setPitch(MathHelper.clamp(pitch, -90.0f, 90.0f));
     }
- 
-    private void useFirework(MinecraftClient mc, ClientPlayerEntity p) {
-        if (tickCounter - lastFireworkTick < FIREWORK_MIN_GAP) return;
-        // Momentum hala yuksekse (onceki fisek calisiyor / hiz dusmedi) yeni fisek harcama
-        if (p.getVelocity().length() > MIN_BOOST_SPEED) return;
-        if (!p.getOffHandStack().isOf(Items.FIREWORK_ROCKET)) return;
-        mc.interactionManager.interactItem(p, Hand.OFF_HAND);
-        lastFireworkTick = tickCounter;
+
+    /** Fires an offhand rocket, at most once every HunterConfig.fireworkInterval ticks. */
+    private void useFirework(MinecraftClient mc, ClientPlayerEntity player) {
+        if (rocketCooldown < Math.max(1, HunterConfig.fireworkInterval)) return;
+        if (!player.getOffHandStack().isOf(Items.FIREWORK_ROCKET)) return;
+        mc.interactionManager.interactItem(player, Hand.OFF_HAND);
+        rocketCooldown = 0;
     }
- 
-    private void equipSword(ClientPlayerEntity p) {
-        if (p.getMainHandStack().isIn(ItemTags.SWORDS)) return;
-        PlayerInventory inv = p.getInventory();
+
+    private void equipSword(ClientPlayerEntity player) {
+        if (player.getMainHandStack().isIn(ItemTags.SWORDS)) return;
+        PlayerInventory inv = player.getInventory();
         for (int i = 0; i < 9; i++) {
             if (inv.getStack(i).isIn(ItemTags.SWORDS)) {
                 inv.setSelectedSlot(i);
@@ -197,21 +241,50 @@ public class ElytraHunterClient implements ClientModInitializer {
             }
         }
     }
- 
+
     private void releaseJump(MinecraftClient mc) {
         if (jumpHeld) {
             mc.options.jumpKey.setPressed(false);
             jumpHeld = false;
         }
     }
- 
+
     private void reset(MinecraftClient mc) {
         releaseJump(mc);
         target = null;
         lastTargetPos = null;
         state = State.APPROACH;
         retreatTicks = 0;
-        lastFireworkTick = -1000;
+        active = false;
+    }
+
+    // ------------------------------------------------------------------ HUD snapshots
+    private void endTick(MinecraftClient mc) {
+        ClientPlayerEntity p = mc.player;
+        if (p == null || mc.world == null) {
+            hasSnap = false;
+            curTarget = null;
+            snapTarget = null;
+            return;
+        }
+        Vec3d eye = new Vec3d(p.getX(), p.getEyeY(), p.getZ());
+        prevEye = hasSnap && curEye != null ? curEye : eye;
+        curEye = eye;
+        prevYaw = hasSnap ? curYaw : p.getYaw();
+        curYaw = p.getYaw();
+        prevPitch = hasSnap ? curPitch : p.getPitch();
+        curPitch = p.getPitch();
+        hasSnap = true;
+
+        if (target != null && active) {
+            Vec3d c = new Vec3d(target.getX(), target.getY() + target.getHeight() * 0.5, target.getZ());
+            prevTarget = (curTarget == null || snapTarget != target) ? c : curTarget;
+            curTarget = c;
+            snapTarget = target;
+        } else {
+            curTarget = null;
+            snapTarget = null;
+        }
+        tickEndNanos = System.nanoTime();
     }
 }
- 
