@@ -1,338 +1,290 @@
 package com.elytrahunter;
 
-import java.util.Set;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
-import net.minecraft.util.Hand;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.AbstractClientPlayerEntity;
+import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Items;
-import net.minecraft.util.math.Box;
-import net.minecraft.util.math.Vec3d;
-import net.minecraft.text.Text;
-import net.minecraft.util.Identifier;
-import net.minecraft.client.MinecraftClient;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.text.Text;
+import net.minecraft.util.Hand;
+import net.minecraft.util.Identifier;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
-import net.minecraft.client.network.AbstractClientPlayerEntity;
-import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.util.math.Vec3d;
 import org.lwjgl.glfw.GLFW;
 
+import java.util.Set;
+
+/**
+ * Elytra Hunter 1.1.0
+ *
+ * Hunting logic = 1.0.0 logic (ported from the compiled classes, same constants).
+ * New in 1.1.0: config (firework interval), settings screen, always-on HUD tab, target marker.
+ */
 public class ElytraHunterClient implements ClientModInitializer {
-   private static final double SCAN_RANGE = 96.0;
-   private static final double KEEP_RANGE = 144.0;
-   private static final double ATTACK_REACH = 3.0;
-   private static final double NO_BOOST_DIST = 5.0;
-   private static final float MIN_COOLDOWN = 0.9F;
-   private static final Set<String> FRIENDS = Set.of();
-   private static final int KEY_MENU = 344;
-   private static final int KEY_TOGGLE = 72;
-   private static ElytraHunterClient instance;
-   private State state = State.APPROACH;
-   private AbstractClientPlayerEntity target;
-   private Vec3d lastTargetPos;
-   private int retreatTicks;
-   private int tickCounter;
-   private int rocketCooldown = 1000;
-   private boolean jumpHeld;
-   private boolean active;
-   private boolean menuKeyWas;
-   private boolean toggleKeyWas;
-   Vec3d prevEye;
-   Vec3d curEye;
-   Vec3d prevTarget;
-   Vec3d curTarget;
-   float prevYaw;
-   float curYaw;
-   float prevPitch;
-   float curPitch;
-   long tickEndNanos = System.nanoTime();
-   private AbstractClientPlayerEntity snapTarget;
-   private boolean hasSnap;
 
-   public static ElytraHunterClient instance() {
-      return instance;
-   }
+    public enum State { APPROACH, RETREAT }
 
-   public State getState() {
-      return this.state;
-   }
+    // ---- constants of the original 1.0.0 ----
+    private static final double SCAN_RANGE = 96.0;        // new target search radius
+    private static final double KEEP_RANGE = 144.0;       // target is dropped beyond this
+    private static final double ATTACK_REACH = 3.0;
+    private static final double NO_BOOST_DIST = 5.0;      // no rockets while closer than this (approach)
+    private static final double RETREAT_DISTANCE = 6.0;
+    private static final int RETREAT_MAX_TICKS = 12;
+    private static final float MIN_COOLDOWN = 0.9f;
+    private static final Set<String> FRIENDS = Set.of();  // names that are never targeted
 
-   public AbstractClientPlayerEntity getTarget() {
-      return this.target;
-   }
+    // ---- hotkeys (polled with GLFW, only while no screen is open) ----
+    private static final int KEY_MENU = GLFW.GLFW_KEY_RIGHT_SHIFT;
+    private static final int KEY_TOGGLE = GLFW.GLFW_KEY_H;
 
-   public boolean isActive() {
-      return this.active;
-   }
+    private static ElytraHunterClient instance;
 
-   public void onInitializeClient() {
-      instance = this;
-      HunterConfig.load();
-      ClientTickEvents.START_CLIENT_TICK.register(this::tick);
-      ClientTickEvents.END_CLIENT_TICK.register(this::endTick);
-      HudElementRegistry.addLast(Identifier.of("elytrahunter", "hud"), (context, tickCounter) -> HunterHud.render(context, MinecraftClient.getInstance()));
-   }
+    private State state = State.APPROACH;
+    private AbstractClientPlayerEntity target;
+    private Vec3d lastTargetPos;
+    private int retreatTicks;
+    private int tickCounter;
+    private int rocketCooldown = 1000;
+    private boolean jumpHeld;
+    private boolean active;
+    private boolean menuKeyWas;
+    private boolean toggleKeyWas;
 
-   private void pollKeys(MinecraftClient mc) {
-      if (mc.getWindow() != null) {
-         long window = mc.getWindow().getHandle();
-         boolean menuDown = GLFW.glfwGetKey(window, 344) == 1;
-         boolean toggleDown = GLFW.glfwGetKey(window, 72) == 1;
-         if (mc.currentScreen == null && mc.player != null) {
-            if (menuDown && !this.menuKeyWas) {
-               mc.setScreen(new HunterScreen());
+    // ---- snapshots used by the HUD for smooth interpolation (written at END tick) ----
+    Vec3d prevEye, curEye, prevTarget, curTarget;
+    float prevYaw, curYaw, prevPitch, curPitch;
+    long tickEndNanos = System.nanoTime();
+    private AbstractClientPlayerEntity snapTarget;
+    private boolean hasSnap;
+
+    public static ElytraHunterClient instance() { return instance; }
+    public State getState() { return state; }
+    public AbstractClientPlayerEntity getTarget() { return target; }
+    public boolean isActive() { return active; }
+
+    @Override
+    public void onInitializeClient() {
+        instance = this;
+        HunterConfig.load();
+        ClientTickEvents.START_CLIENT_TICK.register(this::tick);
+        ClientTickEvents.END_CLIENT_TICK.register(this::endTick);
+        HudElementRegistry.addLast(Identifier.of("elytrahunter", "hud"),
+                (context, tickCounter) -> HunterHud.render(context, MinecraftClient.getInstance()));
+    }
+
+    // ------------------------------------------------------------------ keys
+    private void pollKeys(MinecraftClient mc) {
+        if (mc.getWindow() == null) return;
+        long window = mc.getWindow().getHandle();
+        boolean menuDown = GLFW.glfwGetKey(window, KEY_MENU) == GLFW.GLFW_PRESS;
+        boolean toggleDown = GLFW.glfwGetKey(window, KEY_TOGGLE) == GLFW.GLFW_PRESS;
+
+        if (mc.currentScreen == null && mc.player != null) {
+            if (menuDown && !menuKeyWas) {
+                mc.setScreen(new HunterScreen());
             }
-
-            if (toggleDown && !this.toggleKeyWas) {
-               HunterConfig.enabled = !HunterConfig.enabled;
-               HunterConfig.save();
-               mc.player.sendMessage(Text.literal("Elytra Hunter: " + (HunterConfig.enabled ? "AÇIK" : "KAPALI")), true);
+            if (toggleDown && !toggleKeyWas) {
+                HunterConfig.enabled = !HunterConfig.enabled;
+                HunterConfig.save();
+                mc.player.sendMessage(Text.literal("Elytra Hunter: "
+                        + (HunterConfig.enabled ? "A\u00c7IK" : "KAPALI")), true);
             }
-         }
+        }
+        menuKeyWas = menuDown;
+        toggleKeyWas = toggleDown;
+    }
 
-         this.menuKeyWas = menuDown;
-         this.toggleKeyWas = toggleDown;
-      }
-   }
+    // ------------------------------------------------------------------ main tick (original logic)
+    private void tick(MinecraftClient mc) {
+        pollKeys(mc);
 
-   private void tick(MinecraftClient mc) {
-      this.pollKeys(mc);
-      ClientPlayerEntity player = mc.player;
-      if (player == null || mc.world == null || mc.interactionManager == null || mc.currentScreen != null) {
-         this.reset(mc);
-         return;
-      }
+        ClientPlayerEntity player = mc.player;
+        if (player == null || mc.world == null || mc.interactionManager == null || mc.currentScreen != null) {
+            reset(mc);
+            return;
+        }
+        if (!HunterConfig.enabled
+                || !player.getEquippedStack(EquipmentSlot.CHEST).isOf(Items.ELYTRA)
+                || !player.getOffHandStack().isOf(Items.FIREWORK_ROCKET)) {
+            reset(mc);
+            return;
+        }
+        active = true;
+        tickCounter++;
+        if (rocketCooldown < 1000) rocketCooldown++;
 
-      // Tetik: elytra giyili + fisek (sol elde VEYA hotbar'da; GUI'den secilir)
-      if (!HunterConfig.enabled
-            || !player.getEquippedStack(EquipmentSlot.CHEST).isOf(Items.ELYTRA)
-            || !this.hasRocket(player)) {
-         this.reset(mc);
-         return;
-      }
+        if (target == null || !valid(player, target)) {
+            target = findTarget(mc, player);
+            state = State.APPROACH;
+            lastTargetPos = null;
+            retreatTicks = 0;
+        }
+        if (target == null) {
+            releaseJump(mc);
+            return;
+        }
 
-      this.active = true;
-      this.tickCounter++;
-      if (this.rocketCooldown < 1000) {
-         this.rocketCooldown++;
-      }
+        Vec3d targetPos = new Vec3d(target.getX(), target.getY() + target.getHeight() * 0.5, target.getZ());
+        Vec3d targetVel = lastTargetPos == null ? Vec3d.ZERO : targetPos.subtract(lastTargetPos);
+        lastTargetPos = targetPos;
 
-      if (this.target == null || !this.valid(player, this.target)) {
-         this.target = this.findTarget(mc, player);
-         this.state = State.APPROACH;
-         this.lastTargetPos = null;
-         this.retreatTicks = 0;
-      }
-      if (this.target == null) {
-         this.releaseJump(mc);
-         return;
-      }
+        Vec3d eye = new Vec3d(player.getX(), player.getEyeY(), player.getZ());
+        double dist = eye.distanceTo(targetPos);
+        double speed = Math.max(player.getVelocity().length(), 1.0);
+        double lead = MathHelper.clamp(dist / speed, 0.0, 4.0);
+        Vec3d aim = targetPos.add(targetVel.multiply(lead));
 
-      Vec3d targetPos = new Vec3d(
-            this.target.getX(), this.target.getY() + this.target.getHeight() * 0.5, this.target.getZ());
-      Vec3d targetVel = this.lastTargetPos == null ? Vec3d.ZERO : targetPos.subtract(this.lastTargetPos);
-      this.lastTargetPos = targetPos;
-      Vec3d eye = new Vec3d(player.getX(), player.getEyeY(), player.getZ());
-      double dist = eye.distanceTo(targetPos);
-      double speed = Math.max(player.getVelocity().length(), 1.0);
-      double lead = MathHelper.clamp(dist / speed, 0.0, 4.0);
-      Vec3d aim = targetPos.add(targetVel.multiply(lead));
+        if (!player.isGliding()) {
+            // on the ground / falling: tap jump every other tick to open the elytra
+            jumpHeld = true;
+            mc.options.jumpKey.setPressed(tickCounter % 2 == 0);
+            lookAt(player, eye, aim);
+            return;
+        }
 
-      // Havada degilsek: kalkis
-      if (!player.isGliding()) {
-         this.jumpHeld = true;
-         mc.options.jumpKey.setPressed(this.tickCounter % 2 == 0);
-         this.lookAt(player, eye, aim);
-         return;
-      }
-      this.releaseJump(mc);
-      this.equipSword(player);
+        releaseJump(mc);
+        equipSword(player);
 
-      double retreatDist = HunterConfig.retreatDistance;
-
-      if (this.state == State.APPROACH) {
-         this.lookAt(player, eye, aim);
-
-         if (dist > NO_BOOST_DIST) {
-            this.useFirework(mc, player);
-         }
-
-         if (this.reachDistance(eye, this.target) <= ATTACK_REACH
-               && player.getAttackCooldownProgress(0.0F) >= MIN_COOLDOWN) {
-            mc.interactionManager.attackEntity(player, this.target);
-            player.swingHand(Hand.MAIN_HAND);
-            // Uzaklasma 0 ise geri cekilme yok: hedefin dibinde dolasmaya devam eder
-            if (retreatDist >= 0.25) {
-               this.state = State.RETREAT;
-               this.retreatTicks = 0;
+        if (state == State.APPROACH) {
+            lookAt(player, eye, aim);
+            if (dist > NO_BOOST_DIST) {
+                useFirework(mc, player);
             }
-         }
-      } else {
-         // RETREAT: sadece ayarlanan mesafeye kadar uzaklas (fisek harcamadan, mevcut hizla)
-         this.retreatTicks++;
-         Vec3d away = eye.subtract(targetPos);
-         if (away.lengthSquared() < 1.0E-4) {
-            away = new Vec3d(0.0, 1.0, 0.0);
-         }
-         Vec3d retreatPoint = eye.add(away.normalize().multiply(8.0)).add(0.0, 1.0, 0.0);
-         this.lookAt(player, eye, retreatPoint);
+            if (reachDistance(eye, target) <= ATTACK_REACH
+                    && player.getAttackCooldownProgress(0.0f) >= MIN_COOLDOWN) {
+                mc.interactionManager.attackEntity(player, target);
+                player.swingHand(Hand.MAIN_HAND);
+                state = State.RETREAT;
+                retreatTicks = 0;
+            }
+        } else {
+            retreatTicks++;
+            Vec3d away = eye.subtract(targetPos);
+            if (away.lengthSquared() < 1.0E-4) {
+                away = new Vec3d(0.0, 1.0, 0.0);
+            }
+            Vec3d retreatPoint = eye.add(away.normalize().multiply(8.0)).add(0.0, 1.0, 0.0);
+            lookAt(player, eye, retreatPoint);
+            useFirework(mc, player);
 
-         int maxTicks = (int) MathHelper.clamp(6.0 + retreatDist * 1.5, 6.0, 30.0);
-         if (dist >= retreatDist || this.retreatTicks >= maxTicks || retreatDist < 0.25) {
-            this.state = State.APPROACH;
-         }
-      }
-   }
+            boolean farEnough = dist >= RETREAT_DISTANCE;
+            boolean ready = player.getAttackCooldownProgress(0.0f) >= MIN_COOLDOWN;
+            if ((farEnough && ready) || retreatTicks >= RETREAT_MAX_TICKS) {
+                state = State.APPROACH;
+            }
+        }
+    }
 
-   private boolean hasRocket(ClientPlayerEntity player) {
-      if (HunterConfig.hotbarFirework) {
-         return this.findHotbarRocket(player) >= 0;
-      }
-      return player.getOffHandStack().isOf(Items.FIREWORK_ROCKET);
-   }
+    private boolean valid(ClientPlayerEntity player, AbstractClientPlayerEntity t) {
+        return t.isAlive() && !t.isRemoved() && !t.isSpectator() && player.distanceTo(t) <= KEEP_RANGE;
+    }
 
-   private int findHotbarRocket(ClientPlayerEntity player) {
-      PlayerInventory inv = player.getInventory();
-      for (int i = 0; i < 9; i++) {
-         if (inv.getStack(i).isOf(Items.FIREWORK_ROCKET)) {
-            return i;
-         }
-      }
-      return -1;
-   }
-
-   private boolean valid(ClientPlayerEntity player, AbstractClientPlayerEntity t) {
-      return t.isAlive() && !t.isRemoved() && !t.isSpectator() && player.distanceTo(t) <= 144.0;
-   }
-
-   private AbstractClientPlayerEntity findTarget(MinecraftClient mc, ClientPlayerEntity player) {
-      AbstractClientPlayerEntity best = null;
-      double bestDist = 96.0;
-
-      for (AbstractClientPlayerEntity other : mc.world.getPlayers()) {
-         if (other != player && other.isAlive() && !other.isSpectator() && !FRIENDS.contains(other.getGameProfile().name())) {
+    private AbstractClientPlayerEntity findTarget(MinecraftClient mc, ClientPlayerEntity player) {
+        AbstractClientPlayerEntity best = null;
+        double bestDist = SCAN_RANGE;
+        for (AbstractClientPlayerEntity other : mc.world.getPlayers()) {
+            if (other == player) continue;
+            if (!other.isAlive()) continue;
+            if (other.isSpectator()) continue;
+            if (FRIENDS.contains(other.getGameProfile().name())) continue;
             double d = player.distanceTo(other);
             if (d < bestDist) {
-               bestDist = d;
-               best = other;
+                bestDist = d;
+                best = other;
             }
-         }
-      }
+        }
+        return best;
+    }
 
-      return best;
-   }
+    /** Distance from a point to the closest point of the target's hitbox. */
+    private double reachDistance(Vec3d from, AbstractClientPlayerEntity t) {
+        Box box = t.getBoundingBox();
+        double x = MathHelper.clamp(from.x, box.minX, box.maxX);
+        double y = MathHelper.clamp(from.y, box.minY, box.maxY);
+        double z = MathHelper.clamp(from.z, box.minZ, box.maxZ);
+        return from.distanceTo(new Vec3d(x, y, z));
+    }
 
-   private double reachDistance(Vec3d from, AbstractClientPlayerEntity t) {
-      Box box = t.getBoundingBox();
-      double x = MathHelper.clamp(from.x, box.minX, box.maxX);
-      double y = MathHelper.clamp(from.y, box.minY, box.maxY);
-      double z = MathHelper.clamp(from.z, box.minZ, box.maxZ);
-      return from.distanceTo(new Vec3d(x, y, z));
-   }
+    private void lookAt(ClientPlayerEntity player, Vec3d from, Vec3d to) {
+        double dx = to.x - from.x;
+        double dy = to.y - from.y;
+        double dz = to.z - from.z;
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
+        float yaw = (float) (MathHelper.atan2(dz, dx) * 180.0 / Math.PI) - 90.0f;
+        float pitch = (float) (-(MathHelper.atan2(dy, horizontal) * 180.0 / Math.PI));
+        player.setYaw(yaw);
+        player.setPitch(MathHelper.clamp(pitch, -90.0f, 90.0f));
+    }
 
-   private void lookAt(ClientPlayerEntity player, Vec3d from, Vec3d to) {
-      double dx = to.x - from.x;
-      double dy = to.y - from.y;
-      double dz = to.z - from.z;
-      double horizontal = Math.sqrt(dx * dx + dz * dz);
-      float yaw = (float)(MathHelper.atan2(dz, dx) * 180.0 / Math.PI) - 90.0F;
-      float pitch = (float)(-(MathHelper.atan2(dy, horizontal) * 180.0 / Math.PI));
-      player.setYaw(yaw);
-      player.setPitch(MathHelper.clamp(pitch, -90.0F, 90.0F));
-   }
+    /** Fires an offhand rocket, at most once every HunterConfig.fireworkInterval ticks. */
+    private void useFirework(MinecraftClient mc, ClientPlayerEntity player) {
+        if (rocketCooldown < Math.max(1, HunterConfig.fireworkInterval)) return;
+        if (!player.getOffHandStack().isOf(Items.FIREWORK_ROCKET)) return;
+        mc.interactionManager.interactItem(player, Hand.OFF_HAND);
+        rocketCooldown = 0;
+    }
 
-   private void useFirework(MinecraftClient mc, ClientPlayerEntity player) {
-      // iki fisek arasi minimum sure
-      if (this.rocketCooldown < Math.max(1, HunterConfig.fireworkInterval)) {
-         return;
-      }
-      // momentum hala yuksekse yeni fisek harcama
-      if (HunterConfig.minBoostSpeed > 0 && player.getVelocity().length() * 20.0 > HunterConfig.minBoostSpeed) {
-         return;
-      }
-
-      if (HunterConfig.hotbarFirework) {
-         int slot = this.findHotbarRocket(player);
-         if (slot < 0) {
-            return;
-         }
-         PlayerInventory inv = player.getInventory();
-         int prev = inv.getSelectedSlot();
-         inv.setSelectedSlot(slot);
-         mc.interactionManager.interactItem(player, Hand.MAIN_HAND);
-         inv.setSelectedSlot(prev); // kilica geri don
-         this.rocketCooldown = 0;
-      } else {
-         if (!player.getOffHandStack().isOf(Items.FIREWORK_ROCKET)) {
-            return;
-         }
-         mc.interactionManager.interactItem(player, Hand.OFF_HAND);
-         this.rocketCooldown = 0;
-      }
-   }
-
-   private void equipSword(ClientPlayerEntity player) {
-      if (!player.getMainHandStack().isIn(ItemTags.SWORDS)) {
-         PlayerInventory inv = player.getInventory();
-
-         for (int i = 0; i < 9; i++) {
+    private void equipSword(ClientPlayerEntity player) {
+        if (player.getMainHandStack().isIn(ItemTags.SWORDS)) return;
+        PlayerInventory inv = player.getInventory();
+        for (int i = 0; i < 9; i++) {
             if (inv.getStack(i).isIn(ItemTags.SWORDS)) {
-               inv.setSelectedSlot(i);
-               return;
+                inv.setSelectedSlot(i);
+                return;
             }
-         }
-      }
-   }
+        }
+    }
 
-   private void releaseJump(MinecraftClient mc) {
-      if (this.jumpHeld) {
-         mc.options.jumpKey.setPressed(false);
-         this.jumpHeld = false;
-      }
-   }
+    private void releaseJump(MinecraftClient mc) {
+        if (jumpHeld) {
+            mc.options.jumpKey.setPressed(false);
+            jumpHeld = false;
+        }
+    }
 
-   private void reset(MinecraftClient mc) {
-      this.releaseJump(mc);
-      this.target = null;
-      this.lastTargetPos = null;
-      this.state = State.APPROACH;
-      this.retreatTicks = 0;
-      this.active = false;
-   }
+    private void reset(MinecraftClient mc) {
+        releaseJump(mc);
+        target = null;
+        lastTargetPos = null;
+        state = State.APPROACH;
+        retreatTicks = 0;
+        active = false;
+    }
 
-   private void endTick(MinecraftClient mc) {
-      ClientPlayerEntity p = mc.player;
-      if (p != null && mc.world != null) {
-         Vec3d eye = new Vec3d(p.getX(), p.getEyeY(), p.getZ());
-         this.prevEye = this.hasSnap && this.curEye != null ? this.curEye : eye;
-         this.curEye = eye;
-         this.prevYaw = this.hasSnap ? this.curYaw : p.getYaw();
-         this.curYaw = p.getYaw();
-         this.prevPitch = this.hasSnap ? this.curPitch : p.getPitch();
-         this.curPitch = p.getPitch();
-         this.hasSnap = true;
-         if (this.target != null && this.active) {
-            Vec3d c = new Vec3d(this.target.getX(), this.target.getY() + this.target.getHeight() * 0.5, this.target.getZ());
-            this.prevTarget = this.curTarget != null && this.snapTarget == this.target ? this.curTarget : c;
-            this.curTarget = c;
-            this.snapTarget = this.target;
-         } else {
-            this.curTarget = null;
-            this.snapTarget = null;
-         }
+    // ------------------------------------------------------------------ HUD snapshots
+    private void endTick(MinecraftClient mc) {
+        ClientPlayerEntity p = mc.player;
+        if (p == null || mc.world == null) {
+            hasSnap = false;
+            curTarget = null;
+            snapTarget = null;
+            return;
+        }
+        Vec3d eye = new Vec3d(p.getX(), p.getEyeY(), p.getZ());
+        prevEye = hasSnap && curEye != null ? curEye : eye;
+        curEye = eye;
+        prevYaw = hasSnap ? curYaw : p.getYaw();
+        curYaw = p.getYaw();
+        prevPitch = hasSnap ? curPitch : p.getPitch();
+        curPitch = p.getPitch();
+        hasSnap = true;
 
-         this.tickEndNanos = System.nanoTime();
-      } else {
-         this.hasSnap = false;
-         this.curTarget = null;
-         this.snapTarget = null;
-      }
-   }
-
-   public static enum State {
-      APPROACH,
-      RETREAT;
-   }
+        if (target != null && active) {
+            Vec3d c = new Vec3d(target.getX(), target.getY() + target.getHeight() * 0.5, target.getZ());
+            prevTarget = (curTarget == null || snapTarget != target) ? c : curTarget;
+            curTarget = c;
+            snapTarget = target;
+        } else {
+            curTarget = null;
+            snapTarget = null;
+        }
+        tickEndNanos = System.nanoTime();
+    }
 }
