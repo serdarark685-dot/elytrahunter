@@ -22,10 +22,11 @@ import org.lwjgl.glfw.GLFW;
 import java.util.Set;
 
 /**
- * Elytra Hunter 1.1.0
+ * Elytra Hunter 1.2.0
  *
  * Hunting logic = 1.0.0 logic (ported from the compiled classes, same constants).
- * New in 1.1.0: config (firework interval), settings screen, always-on HUD tab, target marker.
+ * 1.1.0: config (firework interval), settings screen, always-on HUD tab, target marker.
+ * 1.2.0: elytra-target options (smooth rotation, prediction modes, aim point, safe mode, far firework interval).
  */
 public class ElytraHunterClient implements ClientModInitializer {
 
@@ -138,8 +139,11 @@ public class ElytraHunterClient implements ClientModInitializer {
         Vec3d eye = new Vec3d(player.getX(), player.getEyeY(), player.getZ());
         double dist = eye.distanceTo(targetPos);
         double speed = Math.max(player.getVelocity().length(), 1.0);
-        double lead = MathHelper.clamp(dist / speed, 0.0, 4.0);
-        Vec3d aim = targetPos.add(targetVel.multiply(lead));
+        Vec3d aim = predictAim(targetPos, targetVel, dist, speed);
+        if (HunterConfig.aimPoint == 1) {
+            // aim at the eyes instead of the middle of the body
+            aim = aim.add(0.0, target.getEyeY() - targetPos.y, 0.0);
+        }
 
         if (!player.isGliding()) {
             // on the ground / falling: tap jump every other tick to open the elytra
@@ -152,10 +156,16 @@ public class ElytraHunterClient implements ClientModInitializer {
         releaseJump(mc);
         equipSword(player);
 
+        if (HunterConfig.safeMode
+                && !mc.world.isSpaceEmpty(player, player.getBoundingBox().offset(player.getVelocity()))) {
+            // about to hit something next tick: nudge upwards
+            player.addVelocity(0.0, 0.1, 0.0);
+        }
+
         if (state == State.APPROACH) {
             lookAt(player, eye, aim);
             if (dist > NO_BOOST_DIST) {
-                useFirework(mc, player);
+                useFirework(mc, player, dist);
             }
             if (reachDistance(eye, target) <= ATTACK_REACH
                     && player.getAttackCooldownProgress(0.0f) >= MIN_COOLDOWN) {
@@ -174,7 +184,7 @@ public class ElytraHunterClient implements ClientModInitializer {
             Vec3d retreatPoint = eye.add(away.normalize().multiply(8.0)).add(0.0, 1.0, 0.0);
             lookAt(player, eye, retreatPoint);
             if (HunterConfig.retreatFireworks) {
-                useFirework(mc, player);
+                useFirework(mc, player, dist);
             }
 
             // turn back as soon as we are far enough (menu setting) or the safety cap is hit
@@ -221,9 +231,48 @@ public class ElytraHunterClient implements ClientModInitializer {
         double dz = to.z - from.z;
         double horizontal = Math.sqrt(dx * dx + dz * dz);
         float yaw = (float) (MathHelper.atan2(dz, dx) * 180.0 / Math.PI) - 90.0f;
-        float pitch = (float) (-(MathHelper.atan2(dy, horizontal) * 180.0 / Math.PI));
-        player.setYaw(yaw);
-        player.setPitch(MathHelper.clamp(pitch, -90.0f, 90.0f));
+        float pitch = MathHelper.clamp((float) (-(MathHelper.atan2(dy, horizontal) * 180.0 / Math.PI)), -90.0f, 90.0f);
+
+        if (!HunterConfig.smoothRotation) {
+            player.setYaw(yaw);
+            player.setPitch(pitch);
+            return;
+        }
+
+        // speed-limited turning (menu: yaw / pitch speed in degrees per tick)
+        float deltaYaw = MathHelper.wrapDegrees(yaw - player.getYaw());
+        float deltaPitch = pitch - player.getPitch();
+        double now = System.currentTimeMillis();
+        // gentle wobble so the turn rate is not perfectly constant (1.0x .. 1.5x)
+        float wobble = 1.25f + 0.25f * (float) Math.sin(now / 300.0);
+        // target is behind us: turn harder
+        float behind = Math.abs(deltaYaw) > 90.0f ? 1.5f : 1.0f;
+        float maxYaw = HunterConfig.yawSpeed * wobble * behind;
+        float maxPitch = HunterConfig.pitchSpeed * wobble;
+        float moveYaw = MathHelper.clamp(deltaYaw, -maxYaw, maxYaw);
+        float movePitch = MathHelper.clamp(deltaPitch, -maxPitch, maxPitch);
+        // tiny drift once almost aligned
+        if (Math.abs(deltaYaw) + Math.abs(deltaPitch) < 5.0f) {
+            float drift = (float) (Math.sin(now / 90.0) * 0.07 + Math.cos(now / 130.0) * 0.05);
+            moveYaw += drift * 0.2f;
+            movePitch += drift * 0.8f;
+        }
+        player.setYaw(player.getYaw() + moveYaw);
+        player.setPitch(MathHelper.clamp(player.getPitch() + movePitch, -90.0f, 90.0f));
+    }
+
+    /** Where to aim, depending on the prediction mode chosen in the menu. */
+    private Vec3d predictAim(Vec3d targetPos, Vec3d targetVel, double dist, double speed) {
+        switch (HunterConfig.predictMode) {
+            case 0:
+                return targetPos;
+            case 2:
+                return targetPos.add(targetVel.multiply(HunterConfig.predictMultiplier));
+            default: {
+                double lead = MathHelper.clamp(dist / speed, 0.0, 4.0);
+                return targetPos.add(targetVel.multiply(lead));
+            }
+        }
     }
 
     /**
@@ -231,8 +280,9 @@ public class ElytraHunterClient implements ClientModInitializer {
      * Offhand mode: use the offhand rocket.
      * Hotbar mode: select the rocket slot, use it, and switch straight back - all in the same tick.
      */
-    private void useFirework(MinecraftClient mc, ClientPlayerEntity player) {
-        if (rocketCooldown < Math.max(1, HunterConfig.fireworkInterval)) return;
+    private void useFirework(MinecraftClient mc, ClientPlayerEntity player, double dist) {
+        int interval = dist > HunterConfig.farDistance ? HunterConfig.farInterval : HunterConfig.fireworkInterval;
+        if (rocketCooldown < Math.max(1, interval)) return;
 
         if (HunterConfig.hotbarMode) {
             PlayerInventory inv = player.getInventory();
