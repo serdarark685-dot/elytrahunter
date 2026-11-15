@@ -164,7 +164,7 @@ public class ElytraHunterClient implements ClientModInitializer {
 
         if (state == State.APPROACH) {
             lookAt(player, eye, aim);
-            if (dist > NO_BOOST_DIST) {
+            if (dist > NO_BOOST_DIST || HunterConfig.beeMode) {
                 useFirework(mc, player, dist);
             }
             if (reachDistance(eye, target) <= ATTACK_REACH
@@ -172,10 +172,15 @@ public class ElytraHunterClient implements ClientModInitializer {
                 mc.interactionManager.attackEntity(player, target);
                 player.swingHand(Hand.MAIN_HAND);
                 // already farther than the retreat distance (or retreat set very small): keep attacking
-                state = dist < HunterConfig.retreatDistance ? State.RETREAT : State.APPROACH;
+                state = (!HunterConfig.beeMode && dist < HunterConfig.retreatDistance) ? State.RETREAT : State.APPROACH;
                 retreatTicks = 0;
             }
         } else {
+            if (HunterConfig.beeMode) {
+                // bee mode switched on while retreating: go straight back to attacking
+                state = State.APPROACH;
+                return;
+            }
             retreatTicks++;
             Vec3d away = eye.subtract(targetPos);
             if (away.lengthSquared() < 1.0E-4) {

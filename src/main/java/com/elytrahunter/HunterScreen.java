@@ -65,7 +65,7 @@ public class HunterScreen extends Screen {
         int h = 20;
         int s = 22;
         int x = this.width / 2 - w / 2;
-        int rows = page == 0 ? 8 : 9;
+        int rows = 9;
         int y = this.height / 2 - (s * rows + h) / 2 + 8;
         titleY = y - 16;
         frameTop = y - 26;
@@ -105,6 +105,10 @@ public class HunterScreen extends Screen {
 
             toggle(x, y + s * 7, w, h, "Mini sekme: ",
                     () -> HunterConfig.showPanel, () -> HunterConfig.showPanel = !HunterConfig.showPanel,
+                    "A\u00c7IK", "KAPALI");
+
+            toggle(x, y + s * 8, w, h, "Ar\u0131 modu: ",
+                    () -> HunterConfig.beeMode, () -> HunterConfig.beeMode = !HunterConfig.beeMode,
                     "A\u00c7IK", "KAPALI");
         } else {
             toggle(x, y, w, h, "Yumu\u015fak d\u00f6n\u00fc\u015f: ",

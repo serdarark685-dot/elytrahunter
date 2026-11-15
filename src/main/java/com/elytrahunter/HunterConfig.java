@@ -33,6 +33,9 @@ public final class HunterConfig {
     /** Always-visible mini tab on the left edge. */
     public static boolean showPanel = true;
 
+    /** Bee mode: never retreat after a hit, keep circling the target and hitting; rockets at any distance. */
+    public static boolean beeMode = false;
+
     // ---- 1.2.0: elytra-target style options (all default to the old 1.1.x behaviour) ----
     /** Speed-limited turning instead of snapping straight onto the target. */
     public static boolean smoothRotation = false;
@@ -89,6 +92,7 @@ public final class HunterConfig {
         retreatFireworks = Boolean.parseBoolean(p.getProperty("retreatFireworks", "false"));
         hotbarMode = Boolean.parseBoolean(p.getProperty("hotbarMode", "false"));
         rgb = Boolean.parseBoolean(p.getProperty("rgb", "true"));
+        beeMode = Boolean.parseBoolean(p.getProperty("beeMode", "false"));
         smoothRotation = Boolean.parseBoolean(p.getProperty("smoothRotation", "false"));
         safeMode = Boolean.parseBoolean(p.getProperty("safeMode", "false"));
         yawSpeed = clampInt(p.getProperty("yawSpeed", "54"), 54, MIN_ROT_SPEED, MAX_ROT_SPEED);
@@ -127,6 +131,7 @@ public final class HunterConfig {
         p.setProperty("retreatFireworks", Boolean.toString(retreatFireworks));
         p.setProperty("hotbarMode", Boolean.toString(hotbarMode));
         p.setProperty("rgb", Boolean.toString(rgb));
+        p.setProperty("beeMode", Boolean.toString(beeMode));
         p.setProperty("smoothRotation", Boolean.toString(smoothRotation));
         p.setProperty("safeMode", Boolean.toString(safeMode));
         p.setProperty("yawSpeed", Integer.toString(yawSpeed));
